@@ -1,0 +1,193 @@
+import sys
+from os import listdir, makedirs
+from os.path import isfile, join, abspath, dirname
+import os
+import numpy as np
+import math
+import json
+import cv2
+import scipy.misc
+import tensorflow as tf
+from tensorflow import keras
+import tensorflow.keras.backend as K
+from tensorflow.keras import layers, optimizers, regularizers
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.utils import plot_model
+from tensorflow.keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
+from tensorflow.keras.callbacks import LearningRateScheduler, EarlyStopping
+from tensorflow.python.ops import math_ops
+import matplotlib.pyplot as plt
+from data_utils import import_train_data
+import keras.backend as K
+from scipy.misc import imsave
+
+
+class SALICONtf():
+    def __init__(self, weights=''):
+        self.build_salicon_model()
+        #load weights if provided
+        if weights:
+          self.model.load_weights(weights)
+
+    def build_vgg16(self, input_shape, stream_type):
+        img_input = layers.Input(shape=input_shape, name='Input_' + stream_type)
+        # Block 1
+        x = layers.Conv2D(64, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block1_conv1_'+stream_type)(img_input)
+        x = layers.Conv2D(64, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block1_conv2_'+stream_type)(x)
+        x = layers.MaxPooling2D((2, 2), strides=(2, 2), name='block1_pool_'+stream_type)(x)
+
+        # Block 2
+        x = layers.Conv2D(128, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block2_conv1_'+stream_type)(x)
+        x = layers.Conv2D(128, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block2_conv2_'+stream_type)(x)
+        x = layers.MaxPooling2D((2, 2), strides=(2, 2), name='block2_pool_'+stream_type)(x)
+
+        # Block 3
+        x = layers.Conv2D(256, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block3_conv1_'+stream_type)(x)
+        x = layers.Conv2D(256, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block3_conv2_'+stream_type)(x)
+        x = layers.Conv2D(256, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block3_conv3_'+stream_type)(x)
+        x = layers.MaxPooling2D((2, 2), strides=(2, 2), name='block3_pool_'+stream_type)(x)
+
+        # Block 4
+        x = layers.Conv2D(512, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block4_conv1_'+stream_type)(x)
+        x = layers.Conv2D(512, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block4_conv2_'+stream_type)(x)
+        x = layers.Conv2D(512, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block4_conv3_'+stream_type)(x)
+        x = layers.MaxPooling2D((2, 2), strides=(2, 2), name='block4_pool_'+stream_type)(x)
+
+        # Block 5
+        x = layers.Conv2D(512, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block5_conv1_'+stream_type)(x)
+        x = layers.Conv2D(512, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block5_conv2_'+stream_type)(x)
+        output = layers.Conv2D(512, (3, 3),
+                          activation='relu',
+                          padding='same',
+                          trainable=True,
+                          name='block5_conv3_'+stream_type)(x)
+
+        x = layers.MaxPooling2D((2, 2), strides=(2, 2), name='block5_pool_'+stream_type)(output)
+        x = layers.GlobalMaxPooling2D()(x)
+
+        model = Model(inputs=img_input, outputs=x)
+
+        #initialize each vgg16 stream with ImageNet weights
+        try:
+          print(abspath(dirname(__file__)))
+          model.load_weights(os.path.dirname(os.path.abspath(__file__))+'/vgg16.h5', by_name=False)
+          model = Model(inputs=img_input, outputs=output)
+        except OSError:
+          print(abspath(dirname(__file__)))
+          print("ERROR: VGG weights are not found")
+          sys.exit(-1)
+        return model.input, model.output
+
+
+    def build_salicon_model(self):
+        #create two streams separately
+        fine_stream_input, fine_stream_output = self.build_vgg16(input_shape=(600, 800, 3), stream_type='fine')
+        coarse_stream_input, coarse_stream_output = self.build_vgg16(input_shape=(300, 400, 3), stream_type='coarse')
+
+        #add interpolation layer to the coarse stream
+        H,W = fine_stream_output.shape[1], fine_stream_output.shape[2]
+        interp_layer = layers.Lambda(lambda input_tensor: tf.image.resize_nearest_neighbor(input_tensor, (H, W), align_corners=True))(coarse_stream_output)
+
+        #add concatenation layer followed by 1x1 convolution to combine streams
+        concat_layer = layers.concatenate([fine_stream_output, interp_layer], axis=-1)
+
+        sal_map_layer = layers.Conv2D(1, (1, 1),
+                        name='saliency_map',
+                        trainable=True,
+                        activation='sigmoid',
+                        kernel_initializer=keras.initializers.Zeros(),
+                        bias_initializer=keras.initializers.Zeros())(concat_layer)
+
+        self.model = Model(inputs=[fine_stream_input, coarse_stream_input], outputs=sal_map_layer)
+        self.model.summary()
+        
+    def saliency(self, img_path=None, img=None):
+        vgg_mean = np.array([123, 116, 103])
+
+        if img_path:
+          img_fine = img_to_array(load_img(img_path,
+              grayscale=False,
+              target_size=(600, 800),
+              interpolation='nearest'))
+
+          img_coarse = img_to_array(load_img(img_path,
+              grayscale=False,
+              target_size=(300, 400),
+              interpolation='nearest'))
+
+        else:
+          img_fine = img.copy().resize((800, 600))
+          img_coarse = img.copy().resize((400, 300))
+
+        img_fine -= vgg_mean
+        img_coarse -= vgg_mean
+
+        img_fine = img_fine[None, :]/255
+        img_coarse = img_coarse[None, :]/255
+
+        smap = np.squeeze(self.model.predict([img_fine, img_coarse], batch_size=1, verbose=0))
+
+        if img_path:
+          img = cv2.imread(img_path)
+          h, w = img.shape[:2]
+        else:
+          w, h = img.size[:2]
+
+        smap = (smap - np.min(smap))/((np.max(smap)-np.min(smap)))
+        smap = cv2.resize(smap, (w, h), interpolation=cv2.INTER_CUBIC)  
+        smap = cv2.GaussianBlur(smap, (75, 75), 25, cv2.BORDER_DEFAULT) 
+
+        return smap
+
+
+
+if __name__ == "__main__":
+    main()

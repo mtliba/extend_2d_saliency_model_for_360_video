@@ -1,0 +1,11 @@
+tensorflow==1.14
+joblib==0.13.2
+matplotlib==3.0.3
+numpy==1.16.2
+opencv-python==4.0.0.21
+Pillow==6.2.0
+torch==1.0.1.post2
+torchvision==0.2.2.post3
+scipy==1.1.0
+Keras==2.3.0
+scikit_learn==0.20.2
